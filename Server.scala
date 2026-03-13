@@ -30,38 +30,84 @@ case class FaucetRequest(address: String)
  * Writes are atomic: the chain is serialised to a .tmp file first, then
  * renamed to the final path.  On most Unix systems rename(2) is atomic
  * within the same filesystem, preventing corruption from mid-write crashes.
+ *
+ * If the configured DATA_DIR is not writable, falls back to ./data so the
+ * node can still persist in ephemeral container storage.
  */
 object Persistence {
-  // DATA_DIR can be overridden by env var — used by Docker/Render to point at a mounted disk
-  private val dataDir = sys.env.getOrElse("DATA_DIR", "./data")
-  val filePath        = s"$dataDir/blockchain.json"
-  private val tmpPath = filePath + ".tmp"
+  // Requested directory from env (e.g. /data on Render)
+  private val requestedDir = sys.env.getOrElse("DATA_DIR", "./data")
 
-  /** Persist the current chain to disk.  Creates the data directory if needed. */
-  def save(chain: List[Block]): IO[Unit] = IO.blocking {
-    val dir = Paths.get(dataDir)
+  // Resolved at runtime by ensureDataDir() — may fall back to ./data
+  @volatile private var _activeDir: String = requestedDir
+
+  def activeFilePath: String  = s"${_activeDir}/blockchain.json"
+  def filePath:       String  = activeFilePath   // kept for compat
+  private def tmpPath: String = activeFilePath + ".tmp"
+
+  private def isWritable(dir: java.nio.file.Path): Boolean =
+    try {
+      val probe = dir.resolve(".write-probe")
+      Files.writeString(probe, "ok")
+      Files.deleteIfExists(probe)
+      true
+    } catch { case _: Throwable => false }
+
+  /**
+   * Called once at startup.  Tries to create and verify the primary data
+   * directory; falls back to ./data if the primary is not writable.
+   * All outcomes are printed to stdout (visible in Render logs).
+   */
+  def ensureDataDir(): IO[Unit] = IO.blocking {
+    val primary = Paths.get(requestedDir)
+
+    def trySetup(dir: java.nio.file.Path): Boolean =
+      try {
+        Files.createDirectories(dir)
+        isWritable(dir)
+      } catch { case _: Throwable => false }
+
+    if (trySetup(primary)) {
+      println(s"  [Persistence] Data directory ready: $requestedDir")
+      println(s"  [Persistence] Active file: ${activeFilePath}")
+    } else {
+      println(s"  [Persistence] WARNING: $requestedDir is not writable (permission denied or mount failure)")
+      val fallback = Paths.get("./data")
+      if (trySetup(fallback)) {
+        _activeDir = "./data"
+        println(s"  [Persistence] Falling back to: ./data  (ephemeral — data lost on restart)")
+        println(s"  [Persistence] Active file: ${activeFilePath}")
+      } else {
+        println(s"  [Persistence] FATAL: ./data fallback also failed — persistence is DISABLED")
+      }
+    }
+  }
+
+  /** Persist the current chain to disk, returns the path written on success. */
+  def save(chain: List[Block]): IO[String] = IO.blocking {
+    val dir = Paths.get(_activeDir)
     if (!Files.exists(dir)) Files.createDirectories(dir)
 
     Files.writeString(Paths.get(tmpPath), chain.asJson.spaces2)
 
-    // Prefer ATOMIC_MOVE; fall back to plain replace if the filesystem doesn't support it
     try
-      Files.move(Paths.get(tmpPath), Paths.get(filePath),
+      Files.move(Paths.get(tmpPath), Paths.get(activeFilePath),
         StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     catch { case _: java.nio.file.AtomicMoveNotSupportedException =>
-      Files.move(Paths.get(tmpPath), Paths.get(filePath),
+      Files.move(Paths.get(tmpPath), Paths.get(activeFilePath),
         StandardCopyOption.REPLACE_EXISTING)
     }
+
+    activeFilePath
   }
 
   /**
    * Load the chain from disk.
-   * Returns None if the file doesn't exist; logs a warning and returns None
-   * if the file is present but fails to parse (so the node starts fresh
-   * rather than crashing).
+   * Returns None if the file doesn't exist; returns None (and logs a warning)
+   * if present but unparseable — the node starts fresh rather than crashing.
    */
   def load(): IO[Option[List[Block]]] = IO.blocking {
-    val p = Paths.get(filePath)
+    val p = Paths.get(activeFilePath)
     if (!Files.exists(p)) None
     else parser.decode[List[Block]](Files.readString(p)).toOption
   }
@@ -71,45 +117,81 @@ object Persistence {
 
 object SummitCoinNode extends IOApp.Simple {
 
-  // Single shared blockchain instance.
-  // Note: mutable state is not synchronised beyond IO.blocking serialisation
-  // of mining.  A production node would use cats.effect.std.Mutex or Ref.
   private val bc = new Blockchain()
 
-  // Track when we last saved to disk (reported by GET /status)
-  @volatile private var lastSaved: Option[Instant] = None
+  // Either[errorMessage, lastSuccessTimestamp]
+  @volatile private var lastSaveStatus: Either[String, Instant] = Left("never")
 
-  // circe decoders for incoming JSON request bodies
-  given EntityDecoder[IO, TxRequest]    = jsonOf[IO, TxRequest]
+  given EntityDecoder[IO, TxRequest]     = jsonOf[IO, TxRequest]
   given EntityDecoder[IO, FaucetRequest] = jsonOf[IO, FaucetRequest]
 
-  // Save the chain and record the timestamp
+  /**
+   * Save the chain, update lastSaveStatus, and log the result.
+   * Errors are logged and recorded but NOT re-raised, so mining/faucet
+   * routes still return success even when persistence fails.
+   */
   private def saveChain: IO[Unit] =
-    Persistence.save(bc.getChain) *> IO { lastSaved = Some(Instant.now()) }
+    Persistence.save(bc.getChain)
+      .flatMap { path =>
+        val n = bc.getChain.length
+        IO { lastSaveStatus = Right(Instant.now()) } *>
+        IO.println(s"  Blockchain saved to $path ($n blocks)")
+      }
+      .handleErrorWith { e =>
+        val msg = s"${e.getClass.getName}: ${e.getMessage}"
+        IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
+        IO.println(s"  ERROR: Blockchain save failed!") *>
+        IO.println(s"  ${msg}") *>
+        IO.println(s"  Active path: ${Persistence.activeFilePath}")
+      }
 
   // ── Routes ──────────────────────────────────────────────────────────────────
 
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
 
     // ── GET /health ───────────────────────────────────────────────────────────
-    // Lightweight liveness probe for cloud health checks.
     case GET -> Root / "health" =>
       Ok(Json.obj("status" -> "ok".asJson))
 
     // ── GET /status ───────────────────────────────────────────────────────────
-    // Node and persistence metadata.
     case GET -> Root / "status" =>
+      val saveInfo = lastSaveStatus match {
+        case Right(ts)  => ts.toString
+        case Left(msg)  => msg
+      }
       Ok(Json.obj(
         "blockHeight"     -> bc.chainHeight.asJson,
         "totalBlocks"     -> bc.getChain.length.asJson,
         "smtInSupply"     -> bc.utxoPool.totalSupply.asJson,
         "chainValid"      -> bc.isValid.asJson,
-        "persistenceFile" -> Persistence.filePath.asJson,
-        "lastSaved"       -> lastSaved.map(_.toString).getOrElse("never").asJson
+        "persistenceFile" -> Persistence.activeFilePath.asJson,
+        "lastSaved"       -> saveInfo.asJson
       ))
 
+    // ── GET /persist ──────────────────────────────────────────────────────────
+    // Manually trigger a save and report the outcome — useful for diagnosis.
+    case GET -> Root / "persist" =>
+      Persistence.save(bc.getChain)
+        .flatMap { path =>
+          val n = bc.getChain.length
+          IO { lastSaveStatus = Right(Instant.now()) } *>
+          IO.println(s"  Manual /persist: saved $n blocks to $path") *>
+          Ok(Json.obj(
+            "success" -> true.asJson,
+            "message" -> s"Saved $n blocks to $path".asJson
+          ))
+        }
+        .handleErrorWith { e =>
+          val msg = s"${e.getClass.getName}: ${e.getMessage}"
+          IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
+          IO.println(s"  Manual /persist FAILED: $msg") *>
+          Ok(Json.obj(
+            "success" -> false.asJson,
+            "error"   -> msg.asJson
+          ))
+        }
+
     // ── POST /wallet/new ──────────────────────────────────────────────────────
-    // Generate a fresh wallet address.
     case POST -> Root / "wallet" / "new" =>
       val wallet = Wallet.generate()
       Ok(Json.obj(
@@ -145,7 +227,6 @@ object SummitCoinNode extends IOApp.Simple {
       ))
 
     // ── POST /transactions ────────────────────────────────────────────────────
-    // Submit a spend transaction to the mempool.
     case req @ POST -> Root / "transactions" =>
       req.as[TxRequest].flatMap { body =>
         val senderUTXOs = bc.utxoPool.getByOwner(body.sender)
@@ -167,7 +248,6 @@ object SummitCoinNode extends IOApp.Simple {
       }
 
     // ── GET /mine ─────────────────────────────────────────────────────────────
-    // Mine pending transactions into a new block, then persist.
     case GET -> Root / "mine" =>
       IO.blocking(bc.mineBlock()).flatMap { block =>
         saveChain *>
@@ -179,7 +259,6 @@ object SummitCoinNode extends IOApp.Simple {
       }
 
     // ── POST /faucet ──────────────────────────────────────────────────────────
-    // Drip 25 SMT from the node wallet, auto-mine, then persist.
     case req @ POST -> Root / "faucet" =>
       req.as[FaucetRequest].flatMap { body =>
         val nodeUTXOs = bc.utxoPool.getByOwner(SummitCoin.NODE_ADDRESS)
@@ -209,26 +288,25 @@ object SummitCoinNode extends IOApp.Simple {
   def run: IO[Unit] = {
     given LoggerFactory[IO] = Slf4jFactory.create[IO]
 
-    // On startup: load persisted chain if available, otherwise start fresh.
-    val startup: IO[Unit] = Persistence.load().flatMap {
-      case None =>
-        IO.println("  No existing blockchain found, starting fresh")
-      case Some(blocks) =>
-        IO.println(s"  Loading blockchain from ${Persistence.filePath}...") *>
-        IO.blocking(bc.restoreFromBlocks(blocks))                          *>
-        IO.println(s"  Restored ${blocks.length} blocks from disk")
-    }.handleErrorWith { e =>
-      IO.println(s"  Warning: could not load blockchain (${e.getMessage}), starting fresh")
-    }
+    val startup: IO[Unit] =
+      Persistence.ensureDataDir() *>
+      Persistence.load().flatMap {
+        case None =>
+          IO.println("  No existing blockchain found, starting fresh")
+        case Some(blocks) =>
+          IO.println(s"  Loading blockchain from ${Persistence.activeFilePath}...") *>
+          IO.blocking(bc.restoreFromBlocks(blocks))                                 *>
+          IO.println(s"  Restored ${blocks.length} blocks from disk")
+      }.handleErrorWith { e =>
+        IO.println(s"  Warning: could not load blockchain (${e.getMessage}), starting fresh")
+      }
 
-    // On shutdown: save the chain before the process exits.
     val shutdown: IO[Unit] =
       IO.println("\n  Shutting down — saving blockchain to disk...") *>
       Persistence.save(bc.getChain)
-        .handleErrorWith(e => IO.println(s"  Warning: save failed: ${e.getMessage}")) *>
-      IO.println("  Blockchain saved. Goodbye!")
+        .flatMap(path => IO.println(s"  Blockchain saved to $path. Goodbye!"))
+        .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getClass.getName}: ${e.getMessage}"))
 
-    // PORT is set by Render (and our Dockerfile ENV); defaults to 8080 for local dev
     val serverPort = sys.env.get("PORT")
       .flatMap(_.toIntOption)
       .flatMap(Port.fromInt)
@@ -247,14 +325,14 @@ object SummitCoinNode extends IOApp.Simple {
       .withHttpApp(corsApp)
       .build
       .use { _ =>
-        IO.println("=" * 60)                                             *>
-        IO.println("  SummitCoin Node  |  SMT Blockchain")               *>
-        IO.println("=" * 60)                                             *>
-        startup                                                          *>
-        IO.println(s"  Listening on   http://0.0.0.0:$serverPort")      *>
-        IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
-        IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros") *>
-        IO.println("=" * 60)                                             *>
+        IO.println("=" * 60)                                                          *>
+        IO.println("  SummitCoin Node  |  SMT Blockchain")                            *>
+        IO.println("=" * 60)                                                          *>
+        startup                                                                       *>
+        IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                   *>
+        IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block")    *>
+        IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")            *>
+        IO.println("=" * 60)                                                          *>
         IO.never.onCancel(shutdown)
       }
   }
