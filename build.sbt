@@ -26,4 +26,21 @@ lazy val root = (project in file("."))
 
     // Suppress spurious "object X is already defined" from circe macro expansion
     scalacOptions += "-Wconf:msg=object.*is already defined:s",
+
+    // ── sbt-assembly (fat jar for Docker) ─────────────────────────────────────
+    assembly / mainClass    := Some("SummitCoinNode"),
+    assembly / assemblyJarName := "summitcoin.jar",
+    assembly / assemblyMergeStrategy := {
+      // ServiceLoader descriptors must be concatenated, not discarded
+      case PathList("META-INF", "services", _*) => MergeStrategy.concat
+      // HOCON reference.conf files must be concatenated (cats-effect, http4s, etc.)
+      case "reference.conf"                      => MergeStrategy.concat
+      // Java 9 module descriptors conflict across dependencies — discard all
+      case x if x.endsWith("module-info.class")  => MergeStrategy.discard
+      // Everything else in META-INF (manifests, licences) can be discarded
+      case PathList("META-INF", _*)              => MergeStrategy.discard
+      case x =>
+        val old = (assembly / assemblyMergeStrategy).value
+        old(x)
+    },
   )

@@ -32,12 +32,14 @@ case class FaucetRequest(address: String)
  * within the same filesystem, preventing corruption from mid-write crashes.
  */
 object Persistence {
-  val filePath = "./data/blockchain.json"
-  private val tmpPath  = filePath + ".tmp"
+  // DATA_DIR can be overridden by env var — used by Docker/Render to point at a mounted disk
+  private val dataDir = sys.env.getOrElse("DATA_DIR", "./data")
+  val filePath        = s"$dataDir/blockchain.json"
+  private val tmpPath = filePath + ".tmp"
 
-  /** Persist the current chain to disk.  Creates ./data/ if needed. */
+  /** Persist the current chain to disk.  Creates the data directory if needed. */
   def save(chain: List[Block]): IO[Unit] = IO.blocking {
-    val dir = Paths.get("./data")
+    val dir = Paths.get(dataDir)
     if (!Files.exists(dir)) Files.createDirectories(dir)
 
     Files.writeString(Paths.get(tmpPath), chain.asJson.spaces2)
@@ -226,6 +228,12 @@ object SummitCoinNode extends IOApp.Simple {
         .handleErrorWith(e => IO.println(s"  Warning: save failed: ${e.getMessage}")) *>
       IO.println("  Blockchain saved. Goodbye!")
 
+    // PORT is set by Render (and our Dockerfile ENV); defaults to 8080 for local dev
+    val serverPort = sys.env.get("PORT")
+      .flatMap(_.toIntOption)
+      .flatMap(Port.fromInt)
+      .getOrElse(port"8080")
+
     val corsApp = CORS.policy
       .withAllowOriginAll
       .withAllowMethodsAll
@@ -235,7 +243,7 @@ object SummitCoinNode extends IOApp.Simple {
     EmberServerBuilder
       .default[IO]
       .withHost(ipv4"0.0.0.0")
-      .withPort(port"8080")
+      .withPort(serverPort)
       .withHttpApp(corsApp)
       .build
       .use { _ =>
@@ -243,7 +251,7 @@ object SummitCoinNode extends IOApp.Simple {
         IO.println("  SummitCoin Node  |  SMT Blockchain")               *>
         IO.println("=" * 60)                                             *>
         startup                                                          *>
-        IO.println(s"  Listening on   http://0.0.0.0:8080")             *>
+        IO.println(s"  Listening on   http://0.0.0.0:$serverPort")      *>
         IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
         IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros") *>
         IO.println("=" * 60)                                             *>

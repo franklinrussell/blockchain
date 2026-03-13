@@ -1,0 +1,24 @@
+# Compiled output — rebuilt inside Docker
+target/
+project/target/
+project/project/
+
+# Git history (not needed in image)
+.git/
+.gitignore
+.github/
+
+# Persisted blockchain data (mounted separately in production)
+data/
+
+# Documentation
+*.md
+
+# IDE / editor metadata
+.metals/
+.bsp/
+.idea/
+*.iml
+
+# Docker meta
+.dockerignore

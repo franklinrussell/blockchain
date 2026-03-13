@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: summitcoin-node
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+
+    envVars:
+      # Port the container listens on — Render routes external traffic here
+      - key: PORT
+        value: 8080
+      # Path inside the container where blockchain.json is written
+      - key: DATA_DIR
+        value: /data
+
+    # Persistent disk — survives deploys and restarts.
+    # blockchain.json is written here so the chain isn't lost on redeploy.
+    # Note: persistent disks require a paid Render plan.
+    disk:
+      name: blockchain-data
+      mountPath: /data
+      sizeGB: 1
