@@ -127,6 +127,7 @@ class UTXOPool {
     pool.values.filter(_.owner == address).toList
   def totalSupply: Double                 = pool.values.map(_.value).sum
   def snapshot: Map[String, TxOutput]    = pool.toMap
+  def clear(): Unit                      = pool.clear()
 }
 
 // ── Mempool ───────────────────────────────────────────────────────────────────
@@ -199,6 +200,24 @@ class Blockchain {
   def chainHeight: Int         = chain.length - 1
   def getChain: List[Block]    = chain
   def getBalance(addr: String) = utxoPool.getByOwner(addr).map(_.value).sum
+
+  /**
+   * Restore state from a persisted chain (loaded from disk).
+   * Clears the current UTXO pool and replays every transaction
+   * from the loaded blocks to reconstruct the final UTXO set.
+   * The mempool is not restored — pending transactions don't survive restarts.
+   */
+  def restoreFromBlocks(blocks: List[Block]): Unit = {
+    utxoPool.clear()
+    chain = blocks
+    for {
+      block <- blocks
+      tx    <- block.transactions
+    } {
+      tx.inputs.foreach(inp => utxoPool.remove(inp.outputId))
+      tx.outputs.foreach(utxoPool.add)
+    }
+  }
 
   // ── Transaction processing ───────────────────────────────────────────────────
 
