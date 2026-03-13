@@ -1,0 +1,17 @@
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss} %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Suppress noisy http4s/CE3 internals; keep WARN+ -->
+  <logger name="org.http4s"       level="WARN"/>
+  <logger name="com.comcast"      level="WARN"/>
+  <logger name="io.netty"         level="WARN"/>
+  <logger name="org.typelevel"    level="WARN"/>
+
+  <root level="INFO">
+    <appender-ref ref="STDOUT"/>
+  </root>
+</configuration>
