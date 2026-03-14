@@ -58,11 +58,26 @@ class DbBackend(xa: Transactor[IO]) extends PersistenceBackend {
     """.update.run.map(_ => ()).transact(xa)
 
   def load(): IO[Option[List[Block]]] =
+    IO.println("  [DB] Querying database for existing blockchain...") *>
     sql"SELECT chain_data FROM blockchain WHERE id = 1"
       .query[String]
       .option
       .transact(xa)
-      .map(_.flatMap(json => parser.decode[List[Block]](json).toOption))
+      .flatMap {
+        case None =>
+          IO.println("  [DB] No row found (id=1) — table is empty") *>
+          IO.pure(None)
+        case Some(json) =>
+          IO.println(s"  [DB] Row found, deserializing JSON (${json.length} chars)...") *>
+          (parser.decode[List[Block]](json) match {
+            case Right(blocks) =>
+              IO.println(s"  [DB] Deserialized ${blocks.length} blocks successfully") *>
+              IO.pure(Some(blocks))
+            case Left(err) =>
+              IO.println(s"  [DB] JSON decode FAILED: $err") *>
+              IO.pure(None)
+          })
+      }
 }
 
 // ── File backend (local dev fallback) ────────────────────────────────────────
@@ -118,11 +133,25 @@ object FileBackend extends PersistenceBackend {
     }
   }
 
-  def load(): IO[Option[List[Block]]] = IO.blocking {
-    val p = Paths.get(activeFilePath)
-    if (!Files.exists(p)) None
-    else parser.decode[List[Block]](Files.readString(p)).toOption
-  }
+  def load(): IO[Option[List[Block]]] =
+    IO.blocking {
+      val p = Paths.get(activeFilePath)
+      if (!Files.exists(p)) None else Some(Files.readString(p))
+    }.flatMap {
+      case None =>
+        IO.println(s"  [File] No file at $activeFilePath — starting fresh") *>
+        IO.pure(None)
+      case Some(json) =>
+        IO.println(s"  [File] Read ${json.length} chars from $activeFilePath, deserializing...") *>
+        (parser.decode[List[Block]](json) match {
+          case Right(blocks) =>
+            IO.println(s"  [File] Deserialized ${blocks.length} blocks successfully") *>
+            IO.pure(Some(blocks))
+          case Left(err) =>
+            IO.println(s"  [File] JSON decode FAILED: $err") *>
+            IO.pure(None)
+        })
+    }
 }
 
 // ── Memory-only backend (last resort) ────────────────────────────────────────
@@ -337,25 +366,34 @@ object SummitCoinNode extends IOApp.Simple {
           )
       }
 
-    // Run: acquire backend → load chain → start server → block forever
+    // Run: acquire backend → restore chain → start server → block forever
+    // NOTE: loadChain runs BEFORE EmberServerBuilder starts so the chain is
+    // fully restored before the first HTTP request can arrive.
     backendResource.use { backend =>
 
       val loadChain: IO[Unit] =
+        IO.println("  Querying database for existing blockchain...") *>
         backend.load().flatMap {
-          case None         => IO.println("  No existing blockchain found, starting fresh")
+          case None =>
+            IO.println("  Database returned empty — starting fresh with genesis block")
           case Some(blocks) =>
-            IO.println(s"  Loading blockchain from ${backend.modeName}...") *>
-            IO.blocking(bc.restoreFromBlocks(blocks))                       *>
-            IO.println(s"  Restored ${blocks.length} blocks")
+            IO.println(s"  Found ${blocks.length} blocks in database, restoring...") *>
+            IO.blocking(bc.restoreFromBlocks(blocks))                                *>
+            // IO.delay defers evaluation so bc.chainHeight is read AFTER restoreFromBlocks runs
+            IO.delay(s"  Restored blockchain: height=${bc.chainHeight}, supply=${bc.utxoPool.totalSupply} SMT")
+              .flatMap(IO.println)
         }.handleErrorWith { e =>
-          IO.println(s"  Warning: load failed (${e.getMessage}), starting fresh")
+          IO.println(s"  Database query FAILED: ${e.getClass.getName}: ${e.getMessage}") *>
+          IO.println(s"  Starting fresh due to error")
         }
 
       val shutdown: IO[Unit] =
-        IO.println("\n  Shutting down — saving blockchain...") *>
-        backend.save(bc.getChain)
-          .flatMap(_ => IO.println("  Blockchain saved. Goodbye!"))
-          .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
+        IO.delay(bc.getChain.length).flatMap { n =>
+          IO.println(s"\n  Shutting down — saving $n blocks to ${backend.modeName}...") *>
+          backend.save(bc.getChain)
+            .flatMap(_ => IO.println(s"  Blockchain saved ($n blocks). Goodbye!"))
+            .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
+        }
 
       val corsApp = CORS.policy
         .withAllowOriginAll
@@ -363,6 +401,8 @@ object SummitCoinNode extends IOApp.Simple {
         .withAllowHeadersAll
         .apply(buildRoutes(backend).orNotFound)
 
+      // Restore chain BEFORE the server socket opens so no request sees stale state
+      loadChain *>
       EmberServerBuilder
         .default[IO]
         .withHost(Host.fromString("0.0.0.0").get)
@@ -370,7 +410,6 @@ object SummitCoinNode extends IOApp.Simple {
         .withHttpApp(corsApp)
         .build
         .use { _ =>
-          // Periodic auto-save every 30 s — safety net in case a post-mine save fails
           val periodicSave: IO[Nothing] =
             (IO.sleep(30.seconds) *> saveChain(backend, "auto-save")).foreverM
 
@@ -379,7 +418,6 @@ object SummitCoinNode extends IOApp.Simple {
           IO.println("=" * 60)                                                       *>
           IO.println(s"  PORT env       = ${sys.env.getOrElse("PORT", "(not set)")}") *>
           IO.println(s"  Binding to     0.0.0.0:$serverPort")                       *>
-          loadChain                                                                  *>
           IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                *>
           IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
           IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")         *>
