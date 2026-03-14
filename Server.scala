@@ -151,7 +151,10 @@ object SummitCoinNode extends IOApp.Simple {
    */
   private def makeTransactor(dbUrl: String): Resource[IO, HikariTransactor[IO]] = {
     val uri     = new java.net.URI(dbUrl.replace("postgresql://", "http://"))
-    val jdbcUrl = s"jdbc:postgresql://${uri.getHost}:${uri.getPort}${uri.getPath}?sslmode=require"
+    // Neon omits the port (uri.getPort == -1); Supabase includes it.
+    // Always append sslmode=require — both Neon and Supabase require SSL.
+    val portStr = if (uri.getPort > 0) s":${uri.getPort}" else ""
+    val jdbcUrl = s"jdbc:postgresql://${uri.getHost}$portStr${uri.getPath}?sslmode=require"
     val Array(user, pass) = uri.getUserInfo.split(":", 2)
 
     ExecutionContexts.fixedThreadPool[IO](8).flatMap { connectEC =>

@@ -24,6 +24,8 @@ lazy val root = (project in file("."))
       "org.tpolecat"   %% "doobie-core"         % doobieVersion,
       "org.tpolecat"   %% "doobie-postgres"     % doobieVersion,
       "org.tpolecat"   %% "doobie-hikari"       % doobieVersion,
+      // Explicit PostgreSQL JDBC driver — must NOT be "provided" so sbt-assembly includes it
+      "org.postgresql"  % "postgresql"           % "42.7.3",
 
       // Logging (required by http4s/CE3 to suppress startup warnings)
       "org.typelevel"  %% "log4cats-slf4j"      % "2.7.0",
