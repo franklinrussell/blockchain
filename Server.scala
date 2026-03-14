@@ -3,6 +3,7 @@ import com.comcast.ip4s.*
 import doobie.*
 import doobie.implicits.*
 import doobie.hikari.HikariTransactor
+import doobie.util.ExecutionContexts
 import io.circe.*
 import io.circe.generic.auto.*
 import io.circe.parser
@@ -24,7 +25,6 @@ case class FaucetRequest(address: String)
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
-/** Common interface for all persistence backends. */
 sealed trait PersistenceBackend {
   def modeName: String
   def save(chain: List[Block]): IO[Unit]
@@ -124,7 +124,7 @@ object FileBackend extends PersistenceBackend {
   }
 }
 
-// ── Memory-only backend (last resort if everything fails) ─────────────────────
+// ── Memory-only backend (last resort) ────────────────────────────────────────
 
 object MemoryBackend extends PersistenceBackend {
   val modeName = "memory"
@@ -143,26 +143,29 @@ object SummitCoinNode extends IOApp.Simple {
   given EntityDecoder[IO, TxRequest]     = jsonOf[IO, TxRequest]
   given EntityDecoder[IO, FaucetRequest] = jsonOf[IO, FaucetRequest]
 
-  /** Build a HikariTransactor from a standard DATABASE_URL string. */
+  /**
+   * Build a HikariTransactor from a standard postgresql:// URL.
+   * Uses doobie's ExecutionContexts.fixedThreadPool for the connect EC
+   * so that blocking JDBC connection acquisition runs on a dedicated
+   * thread pool, not the cats-effect compute pool.
+   */
   private def makeTransactor(dbUrl: String): Resource[IO, HikariTransactor[IO]] = {
-    // Supabase / Render give a URL like:
-    //   postgresql://user:pass@host:5432/dbname
-    // JDBC wants:
-    //   jdbc:postgresql://host:5432/dbname  + separate user/pass
-    val uri      = new java.net.URI(dbUrl.replace("postgresql://", "http://"))
-    val jdbcUrl  = s"jdbc:postgresql://${uri.getHost}:${uri.getPort}${uri.getPath}?sslmode=require"
+    val uri     = new java.net.URI(dbUrl.replace("postgresql://", "http://"))
+    val jdbcUrl = s"jdbc:postgresql://${uri.getHost}:${uri.getPort}${uri.getPath}?sslmode=require"
     val Array(user, pass) = uri.getUserInfo.split(":", 2)
 
-    HikariTransactor.newHikariTransactor[IO](
-      "org.postgresql.Driver",
-      jdbcUrl,
-      user,
-      pass,
-      scala.concurrent.ExecutionContext.global
-    )
+    ExecutionContexts.fixedThreadPool[IO](8).flatMap { connectEC =>
+      HikariTransactor.newHikariTransactor[IO](
+        "org.postgresql.Driver",
+        jdbcUrl,
+        user,
+        pass,
+        connectEC
+      )
+    }
   }
 
-  /** Save chain, log result, never propagate the error (so routes always succeed). */
+  /** Save chain, log result, swallow errors so routes always succeed. */
   private def saveChain(backend: PersistenceBackend): IO[Unit] =
     backend.save(bc.getChain)
       .flatMap { _ =>
@@ -176,15 +179,13 @@ object SummitCoinNode extends IOApp.Simple {
         IO.println(s"  ERROR: Blockchain save failed (${backend.modeName}): $msg")
       }
 
-  // ── Route builder — takes the resolved backend as a parameter ─────────────
+  // ── Routes ───────────────────────────────────────────────────────────────────
 
   def buildRoutes(backend: PersistenceBackend): HttpRoutes[IO] = HttpRoutes.of[IO] {
 
-    // ── GET /health ───────────────────────────────────────────────────────────
     case GET -> Root / "health" =>
       Ok(Json.obj("status" -> "ok".asJson))
 
-    // ── GET /status ───────────────────────────────────────────────────────────
     case GET -> Root / "status" =>
       val saveInfo = lastSaveStatus match {
         case Right(ts) => ts.toString
@@ -199,7 +200,6 @@ object SummitCoinNode extends IOApp.Simple {
         "lastSaved"       -> saveInfo.asJson
       ))
 
-    // ── GET /persist ──────────────────────────────────────────────────────────
     case GET -> Root / "persist" =>
       backend.save(bc.getChain)
         .flatMap { _ =>
@@ -215,13 +215,9 @@ object SummitCoinNode extends IOApp.Simple {
           val msg = s"${e.getClass.getName}: ${e.getMessage}"
           IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
           IO.println(s"  Manual /persist FAILED: $msg") *>
-          Ok(Json.obj(
-            "success" -> false.asJson,
-            "error"   -> msg.asJson
-          ))
+          Ok(Json.obj("success" -> false.asJson, "error" -> msg.asJson))
         }
 
-    // ── POST /wallet/new ──────────────────────────────────────────────────────
     case POST -> Root / "wallet" / "new" =>
       val wallet = Wallet.generate()
       Ok(Json.obj(
@@ -230,7 +226,6 @@ object SummitCoinNode extends IOApp.Simple {
         "unit"    -> SummitCoin.TICKER.asJson
       ))
 
-    // ── GET /balance/:address ─────────────────────────────────────────────────
     case GET -> Root / "balance" / address =>
       Ok(Json.obj(
         "address" -> address.asJson,
@@ -238,7 +233,6 @@ object SummitCoinNode extends IOApp.Simple {
         "unit"    -> SummitCoin.TICKER.asJson
       ))
 
-    // ── GET /chain ────────────────────────────────────────────────────────────
     case GET -> Root / "chain" =>
       Ok(Json.obj(
         "height"  -> bc.chainHeight.asJson,
@@ -248,7 +242,6 @@ object SummitCoinNode extends IOApp.Simple {
         "blocks"  -> bc.getChain.asJson
       ))
 
-    // ── GET /transactions/pending ─────────────────────────────────────────────
     case GET -> Root / "transactions" / "pending" =>
       val pending = bc.mempool.peek
       Ok(Json.obj(
@@ -256,7 +249,6 @@ object SummitCoinNode extends IOApp.Simple {
         "transactions" -> pending.asJson
       ))
 
-    // ── POST /transactions ────────────────────────────────────────────────────
     case req @ POST -> Root / "transactions" =>
       req.as[TxRequest].flatMap { body =>
         val senderUTXOs = bc.utxoPool.getByOwner(body.sender)
@@ -277,7 +269,6 @@ object SummitCoinNode extends IOApp.Simple {
         }
       }
 
-    // ── GET /mine ─────────────────────────────────────────────────────────────
     case GET -> Root / "mine" =>
       IO.blocking(bc.mineBlock()).flatMap { block =>
         saveChain(backend) *>
@@ -288,7 +279,6 @@ object SummitCoinNode extends IOApp.Simple {
         ))
       }
 
-    // ── POST /faucet ──────────────────────────────────────────────────────────
     case req @ POST -> Root / "faucet" =>
       req.as[FaucetRequest].flatMap { body =>
         val nodeUTXOs = bc.utxoPool.getByOwner(SummitCoin.NODE_ADDRESS)
@@ -318,98 +308,73 @@ object SummitCoinNode extends IOApp.Simple {
   def run: IO[Unit] = {
     given LoggerFactory[IO] = Slf4jFactory.create[IO]
 
-    val serverPort = sys.env.get("PORT")
-      .flatMap(_.toIntOption)
-      .flatMap(Port.fromInt)
-      .getOrElse(port"8080")
+    // Read PORT as a plain Int first, then convert — avoids Option.flatMap chains
+    // that could silently fall back to 8080 on Render's injected port value.
+    val portNum    = sys.env.getOrElse("PORT", "8080").toInt
+    val serverPort = Port.fromInt(portNum).getOrElse(port"8080")
 
-    // Resolve which backend to use, then run the server inside its resource scope
-    val program: Resource[IO, Unit] = sys.env.get("DATABASE_URL") match {
-
-      case Some(dbUrl) =>
-        // ── Database path ────────────────────────────────────────────────────
-        makeTransactor(dbUrl).evalMap { xa =>
-          val backend = new DbBackend(xa)
-          val startup: IO[Unit] =
+    // Resolve persistence backend as a Resource so the DB connection pool
+    // is acquired before startup and released cleanly on shutdown.
+    val backendResource: Resource[IO, PersistenceBackend] =
+      sys.env.get("DATABASE_URL") match {
+        case Some(dbUrl) =>
+          makeTransactor(dbUrl).evalMap { xa =>
+            val backend = new DbBackend(xa)
             IO.println("  [Persistence] Mode: database (Supabase PostgreSQL)") *>
-            backend.initSchema() *>
-            backend.load().flatMap {
-              case None         => IO.println("  No existing blockchain found, starting fresh")
-              case Some(blocks) =>
-                IO.println(s"  Loading blockchain from database...") *>
-                IO.blocking(bc.restoreFromBlocks(blocks))            *>
-                IO.println(s"  Restored ${blocks.length} blocks from database")
-            }.handleErrorWith { e =>
-              IO.println(s"  Warning: DB load failed (${e.getMessage}), starting fresh")
-            }
+            backend.initSchema().as(backend: PersistenceBackend)
+          }
+        case None =>
+          Resource.eval(
+            IO.println("  [Persistence] Mode: file (DATABASE_URL not set)") *>
+            FileBackend.ensureDataDir().as(FileBackend: PersistenceBackend)
+          )
+      }
 
-          val shutdown: IO[Unit] =
-            IO.println("\n  Shutting down — saving blockchain to database...") *>
-            backend.save(bc.getChain)
-              .flatMap(_ => IO.println("  Blockchain saved to database. Goodbye!"))
-              .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
+    // Run: acquire backend → load chain → start server → block forever
+    backendResource.use { backend =>
 
-          runServer(backend, startup, shutdown, serverPort)
+      val loadChain: IO[Unit] =
+        backend.load().flatMap {
+          case None         => IO.println("  No existing blockchain found, starting fresh")
+          case Some(blocks) =>
+            IO.println(s"  Loading blockchain from ${backend.modeName}...") *>
+            IO.blocking(bc.restoreFromBlocks(blocks))                       *>
+            IO.println(s"  Restored ${blocks.length} blocks")
+        }.handleErrorWith { e =>
+          IO.println(s"  Warning: load failed (${e.getMessage}), starting fresh")
         }
 
-      case None =>
-        // ── File path (local dev) ─────────────────────────────────────────────
-        Resource.eval {
-          val backend = FileBackend
-          val startup: IO[Unit] =
-            IO.println("  [Persistence] Mode: file (DATABASE_URL not set)") *>
-            backend.ensureDataDir() *>
-            backend.load().flatMap {
-              case None         => IO.println("  No existing blockchain found, starting fresh")
-              case Some(blocks) =>
-                IO.println(s"  Loading blockchain from ${FileBackend.activeFilePath}...") *>
-                IO.blocking(bc.restoreFromBlocks(blocks))                                 *>
-                IO.println(s"  Restored ${blocks.length} blocks from disk")
-            }.handleErrorWith { e =>
-              IO.println(s"  Warning: file load failed (${e.getMessage}), starting fresh")
-            }
+      val shutdown: IO[Unit] =
+        IO.println("\n  Shutting down — saving blockchain...") *>
+        backend.save(bc.getChain)
+          .flatMap(_ => IO.println("  Blockchain saved. Goodbye!"))
+          .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
 
-          val shutdown: IO[Unit] =
-            IO.println("\n  Shutting down — saving blockchain to disk...") *>
-            backend.save(bc.getChain)
-              .flatMap(_ => IO.println(s"  Blockchain saved to ${FileBackend.activeFilePath}. Goodbye!"))
-              .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
+      val corsApp = CORS.policy
+        .withAllowOriginAll
+        .withAllowMethodsAll
+        .withAllowHeadersAll
+        .apply(buildRoutes(backend).orNotFound)
 
-          runServer(backend, startup, shutdown, serverPort)
+      EmberServerBuilder
+        .default[IO]
+        .withHost(Host.fromString("0.0.0.0").get)
+        .withPort(serverPort)
+        .withHttpApp(corsApp)
+        .build
+        .use { _ =>
+          IO.println("=" * 60)                                                       *>
+          IO.println("  SummitCoin Node  |  SMT Blockchain")                         *>
+          IO.println("=" * 60)                                                       *>
+          IO.println(s"  PORT env       = ${sys.env.getOrElse("PORT", "(not set)")}") *>
+          IO.println(s"  Binding to     0.0.0.0:$serverPort")                       *>
+          loadChain                                                                  *>
+          IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                *>
+          IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
+          IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")         *>
+          IO.println("=" * 60)                                                       *>
+          IO.never.onCancel(shutdown)
         }
     }
-
-    program.useForever
-  }
-
-  private def runServer(
-    backend:    PersistenceBackend,
-    startup:    IO[Unit],
-    shutdown:   IO[Unit],
-    serverPort: com.comcast.ip4s.Port
-  ): IO[Unit] = {
-    val corsApp = CORS.policy
-      .withAllowOriginAll
-      .withAllowMethodsAll
-      .withAllowHeadersAll
-      .apply(buildRoutes(backend).orNotFound)
-
-    EmberServerBuilder
-      .default[IO]
-      .withHost(ipv4"0.0.0.0")
-      .withPort(serverPort)
-      .withHttpApp(corsApp)
-      .build
-      .use { _ =>
-        IO.println("=" * 60)                                                        *>
-        IO.println("  SummitCoin Node  |  SMT Blockchain")                          *>
-        IO.println("=" * 60)                                                        *>
-        startup                                                                     *>
-        IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                 *>
-        IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block")  *>
-        IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")          *>
-        IO.println("=" * 60)                                                        *>
-        IO.never.onCancel(shutdown)
-      }
   }
 }
