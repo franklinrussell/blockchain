@@ -10,14 +10,9 @@ services:
       # Port the container listens on — Render routes external traffic here
       - key: PORT
         value: 8080
-      # Path inside the container where blockchain.json is written
-      - key: DATA_DIR
-        value: /data
+      # Supabase PostgreSQL connection string — set this in the Render dashboard.
+      # When present, the node uses database persistence (survives restarts).
+      # When absent, falls back to file persistence (local dev).
+      - key: DATABASE_URL
+        sync: false
 
-    # Persistent disk — survives deploys and restarts.
-    # blockchain.json is written here so the chain isn't lost on redeploy.
-    # Note: persistent disks require a paid Render plan.
-    disk:
-      name: blockchain-data
-      mountPath: /data
-      sizeGB: 1

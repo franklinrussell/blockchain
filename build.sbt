@@ -1,8 +1,9 @@
 ThisBuild / version      := "0.1.0"
 ThisBuild / scalaVersion := "3.8.2"
 
-val http4sVersion = "0.23.27"
-val circeVersion  = "0.14.10"
+val http4sVersion  = "0.23.27"
+val circeVersion   = "0.14.10"
+val doobieVersion  = "1.0.0-RC4"
 
 lazy val root = (project in file("."))
   .settings(
@@ -18,6 +19,11 @@ lazy val root = (project in file("."))
       "io.circe"       %% "circe-core"          % circeVersion,
       "io.circe"       %% "circe-generic"       % circeVersion,
       "io.circe"       %% "circe-parser"        % circeVersion,
+
+      // Database persistence (optional — used when DATABASE_URL is set)
+      "org.tpolecat"   %% "doobie-core"         % doobieVersion,
+      "org.tpolecat"   %% "doobie-postgres"     % doobieVersion,
+      "org.tpolecat"   %% "doobie-hikari"       % doobieVersion,
 
       // Logging (required by http4s/CE3 to suppress startup warnings)
       "org.typelevel"  %% "log4cats-slf4j"      % "2.7.0",
