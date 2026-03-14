@@ -379,6 +379,7 @@ object SummitCoinNode extends IOApp.Simple {
           case Some(blocks) =>
             IO.println(s"  Found ${blocks.length} blocks in database, restoring...") *>
             IO.blocking(bc.restoreFromBlocks(blocks))                                *>
+            IO { lastSaveStatus = Right(Instant.now()) }                             *>
             // IO.delay defers evaluation so bc.chainHeight is read AFTER restoreFromBlocks runs
             IO.delay(s"  Restored blockchain: height=${bc.chainHeight}, supply=${bc.utxoPool.totalSupply} SMT")
               .flatMap(IO.println)
