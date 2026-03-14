@@ -214,43 +214,51 @@ object SummitCoinNode extends IOApp.Simple {
       }
 
   // ── Routes ───────────────────────────────────────────────────────────────────
+  // Routes receive a Ref rather than a direct backend reference so that the
+  // server can start (and bind its port) before the real backend is initialised.
+  // During the brief init window the ref holds MemoryBackend; once the real
+  // backend is ready it is atomically swapped in via backendRef.set.
 
-  def buildRoutes(backend: PersistenceBackend): HttpRoutes[IO] = HttpRoutes.of[IO] {
+  def buildRoutes(backendRef: Ref[IO, PersistenceBackend]): HttpRoutes[IO] = HttpRoutes.of[IO] {
 
     case GET -> Root / "health" =>
       Ok(Json.obj("status" -> "ok".asJson))
 
     case GET -> Root / "status" =>
-      val saveInfo = lastSaveStatus match {
-        case Right(ts) => ts.toString
-        case Left(msg) => msg
+      backendRef.get.flatMap { backend =>
+        val saveInfo = lastSaveStatus match {
+          case Right(ts) => ts.toString
+          case Left(msg) => msg
+        }
+        Ok(Json.obj(
+          "blockHeight"     -> bc.chainHeight.asJson,
+          "totalBlocks"     -> bc.getChain.length.asJson,
+          "smtInSupply"     -> bc.utxoPool.totalSupply.asJson,
+          "chainValid"      -> bc.isValid.asJson,
+          "persistenceMode" -> backend.modeName.asJson,
+          "lastSaved"       -> saveInfo.asJson
+        ))
       }
-      Ok(Json.obj(
-        "blockHeight"     -> bc.chainHeight.asJson,
-        "totalBlocks"     -> bc.getChain.length.asJson,
-        "smtInSupply"     -> bc.utxoPool.totalSupply.asJson,
-        "chainValid"      -> bc.isValid.asJson,
-        "persistenceMode" -> backend.modeName.asJson,
-        "lastSaved"       -> saveInfo.asJson
-      ))
 
     case GET -> Root / "persist" =>
-      backend.save(bc.getChain)
-        .flatMap { _ =>
-          val n = bc.getChain.length
-          IO { lastSaveStatus = Right(Instant.now()) } *>
-          IO.println(s"  Manual /persist: saved $n blocks via ${backend.modeName}") *>
-          Ok(Json.obj(
-            "success" -> true.asJson,
-            "message" -> s"Saved $n blocks via ${backend.modeName}".asJson
-          ))
-        }
-        .handleErrorWith { e =>
-          val msg = s"${e.getClass.getName}: ${e.getMessage}"
-          IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
-          IO.println(s"  Manual /persist FAILED: $msg") *>
-          Ok(Json.obj("success" -> false.asJson, "error" -> msg.asJson))
-        }
+      backendRef.get.flatMap { backend =>
+        backend.save(bc.getChain)
+          .flatMap { _ =>
+            val n = bc.getChain.length
+            IO { lastSaveStatus = Right(Instant.now()) } *>
+            IO.println(s"  Manual /persist: saved $n blocks via ${backend.modeName}") *>
+            Ok(Json.obj(
+              "success" -> true.asJson,
+              "message" -> s"Saved $n blocks via ${backend.modeName}".asJson
+            ))
+          }
+          .handleErrorWith { e =>
+            val msg = s"${e.getClass.getName}: ${e.getMessage}"
+            IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
+            IO.println(s"  Manual /persist FAILED: $msg") *>
+            Ok(Json.obj("success" -> false.asJson, "error" -> msg.asJson))
+          }
+      }
 
     case POST -> Root / "wallet" / "new" =>
       val wallet = Wallet.generate()
@@ -305,13 +313,15 @@ object SummitCoinNode extends IOApp.Simple {
 
     case GET -> Root / "mine" =>
       IO.blocking(bc.mineBlock()).flatMap { block =>
-        IO.println(s"  Block #${block.index} mined, saving to ${backend.modeName}...") *>
-        saveChain(backend, s"Block #${block.index}") *>
-        Ok(Json.obj(
-          "success" -> true.asJson,
-          "message" -> s"Block #${block.index} mined — fresh tracks on the chain!".asJson,
-          "block"   -> block.asJson
-        ))
+        backendRef.get.flatMap { backend =>
+          IO.println(s"  Block #${block.index} mined, saving to ${backend.modeName}...") *>
+          saveChain(backend, s"Block #${block.index}") *>
+          Ok(Json.obj(
+            "success" -> true.asJson,
+            "message" -> s"Block #${block.index} mined — fresh tracks on the chain!".asJson,
+            "block"   -> block.asJson
+          ))
+        }
       }
 
     case req @ POST -> Root / "faucet" =>
@@ -325,14 +335,16 @@ object SummitCoinNode extends IOApp.Simple {
               case Left(err) => BadRequest(Json.obj("error" -> err.asJson))
               case Right(_)  =>
                 IO.blocking(bc.mineBlock()).flatMap { block =>
-                  IO.println(s"  Block #${block.index} mined (faucet), saving to ${backend.modeName}...") *>
-                  saveChain(backend, s"Block #${block.index} faucet") *>
-                  Ok(Json.obj(
-                    "success" -> true.asJson,
-                    "message" -> s"25 SMT dropped to ${body.address} — first tracks are yours!".asJson,
-                    "txId"    -> tx.id.asJson,
-                    "block"   -> block.index.asJson
-                  ))
+                  backendRef.get.flatMap { backend =>
+                    IO.println(s"  Block #${block.index} mined (faucet), saving to ${backend.modeName}...") *>
+                    saveChain(backend, s"Block #${block.index} faucet") *>
+                    Ok(Json.obj(
+                      "success" -> true.asJson,
+                      "message" -> s"25 SMT dropped to ${body.address} — first tracks are yours!".asJson,
+                      "txId"    -> tx.id.asJson,
+                      "block"   -> block.index.asJson
+                    ))
+                  }
                 }
             }
         }
@@ -349,61 +361,23 @@ object SummitCoinNode extends IOApp.Simple {
     val portNum    = sys.env.getOrElse("PORT", "8080").toInt
     val serverPort = Port.fromInt(portNum).getOrElse(port"8080")
 
-    // Resolve persistence backend as a Resource so the DB connection pool
-    // is acquired before startup and released cleanly on shutdown.
-    val backendResource: Resource[IO, PersistenceBackend] =
-      sys.env.get("DATABASE_URL") match {
-        case Some(dbUrl) =>
-          makeTransactor(dbUrl).evalMap { xa =>
-            val backend = new DbBackend(xa)
-            IO.println("  [Persistence] Mode: database (Supabase PostgreSQL)") *>
-            backend.initSchema().as(backend: PersistenceBackend)
-          }
-        case None =>
-          Resource.eval(
-            IO.println("  [Persistence] Mode: file (DATABASE_URL not set)") *>
-            FileBackend.ensureDataDir().as(FileBackend: PersistenceBackend)
-          )
-      }
-
-    // Run: acquire backend → restore chain → start server → block forever
-    // NOTE: loadChain runs BEFORE EmberServerBuilder starts so the chain is
-    // fully restored before the first HTTP request can arrive.
-    backendResource.use { backend =>
-
-      val loadChain: IO[Unit] =
-        IO.println("  Querying database for existing blockchain...") *>
-        backend.load().flatMap {
-          case None =>
-            IO.println("  Database returned empty — starting fresh with genesis block")
-          case Some(blocks) =>
-            IO.println(s"  Found ${blocks.length} blocks in database, restoring...") *>
-            IO.blocking(bc.restoreFromBlocks(blocks))                                *>
-            IO { lastSaveStatus = Right(Instant.now()) }                             *>
-            // IO.delay defers evaluation so bc.chainHeight is read AFTER restoreFromBlocks runs
-            IO.delay(s"  Restored blockchain: height=${bc.chainHeight}, supply=${bc.utxoPool.totalSupply} SMT")
-              .flatMap(IO.println)
-        }.handleErrorWith { e =>
-          IO.println(s"  Database query FAILED: ${e.getClass.getName}: ${e.getMessage}") *>
-          IO.println(s"  Starting fresh due to error")
-        }
-
-      val shutdown: IO[Unit] =
-        IO.delay(bc.getChain.length).flatMap { n =>
-          IO.println(s"\n  Shutting down — saving $n blocks to ${backend.modeName}...") *>
-          backend.save(bc.getChain)
-            .flatMap(_ => IO.println(s"  Blockchain saved ($n blocks). Goodbye!"))
-            .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
-        }
+    // backendRef starts as MemoryBackend (no-op saves) so routes can be wired
+    // up before the real backend initialises.  It is atomically replaced with
+    // the real backend (file or DB) before loadChain runs, ensuring all
+    // post-startup requests hit the correct persistence layer.
+    IO.ref[PersistenceBackend](MemoryBackend).flatMap { backendRef =>
 
       val corsApp = CORS.policy
         .withAllowOriginAll
         .withAllowMethodsAll
         .withAllowHeadersAll
-        .apply(buildRoutes(backend).orNotFound)
+        .apply(buildRoutes(backendRef).orNotFound)
 
-      // Restore chain BEFORE the server socket opens so no request sees stale state
-      loadChain *>
+      // ── Start the HTTP server FIRST ──────────────────────────────────────────
+      // Render scans for an open port immediately after the container starts.
+      // We must bind before any potentially-slow DB cold-start / schema init /
+      // chain load — those all happen inside the use block, after the socket
+      // is already accepting connections.
       EmberServerBuilder
         .default[IO]
         .withHost(Host.fromString("0.0.0.0").get)
@@ -411,20 +385,68 @@ object SummitCoinNode extends IOApp.Simple {
         .withHttpApp(corsApp)
         .build
         .use { _ =>
-          val periodicSave: IO[Nothing] =
-            (IO.sleep(30.seconds) *> saveChain(backend, "auto-save")).foreverM
 
-          IO.println("=" * 60)                                                       *>
-          IO.println("  SummitCoin Node  |  SMT Blockchain")                         *>
-          IO.println("=" * 60)                                                       *>
-          IO.println(s"  PORT env       = ${sys.env.getOrElse("PORT", "(not set)")}") *>
-          IO.println(s"  Binding to     0.0.0.0:$serverPort")                       *>
-          IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                *>
-          IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
-          IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")         *>
-          IO.println(s"  Auto-save      every 30 seconds")                          *>
-          IO.println("=" * 60)                                                       *>
-          periodicSave.background.surround(IO.never.onCancel(shutdown))
+          // ── Then initialise the real persistence backend ─────────────────────
+          val backendResource: Resource[IO, PersistenceBackend] =
+            sys.env.get("DATABASE_URL") match {
+              case Some(dbUrl) =>
+                makeTransactor(dbUrl).evalMap { xa =>
+                  val backend = new DbBackend(xa)
+                  IO.println("  [Persistence] Mode: database (Supabase PostgreSQL)") *>
+                  backend.initSchema().as(backend: PersistenceBackend)
+                }
+              case None =>
+                Resource.eval(
+                  IO.println("  [Persistence] Mode: file (DATABASE_URL not set)") *>
+                  FileBackend.ensureDataDir().as(FileBackend: PersistenceBackend)
+                )
+            }
+
+          backendResource.use { backend =>
+
+            val loadChain: IO[Unit] =
+              IO.println("  Querying database for existing blockchain...") *>
+              backend.load().flatMap {
+                case None =>
+                  IO.println("  Database returned empty — starting fresh with genesis block")
+                case Some(blocks) =>
+                  IO.println(s"  Found ${blocks.length} blocks in database, restoring...") *>
+                  IO.blocking(bc.restoreFromBlocks(blocks))                                *>
+                  IO { lastSaveStatus = Right(Instant.now()) }                             *>
+                  // IO.delay defers evaluation so bc.chainHeight is read AFTER restoreFromBlocks runs
+                  IO.delay(s"  Restored blockchain: height=${bc.chainHeight}, supply=${bc.utxoPool.totalSupply} SMT")
+                    .flatMap(IO.println)
+              }.handleErrorWith { e =>
+                IO.println(s"  Database query FAILED: ${e.getClass.getName}: ${e.getMessage}") *>
+                IO.println(s"  Starting fresh due to error")
+              }
+
+            val shutdown: IO[Unit] =
+              IO.delay(bc.getChain.length).flatMap { n =>
+                IO.println(s"\n  Shutting down — saving $n blocks to ${backend.modeName}...") *>
+                backend.save(bc.getChain)
+                  .flatMap(_ => IO.println(s"  Blockchain saved ($n blocks). Goodbye!"))
+                  .handleErrorWith(e => IO.println(s"  WARNING: shutdown save failed: ${e.getMessage}"))
+              }
+
+            val periodicSave: IO[Nothing] =
+              (IO.sleep(30.seconds) *> saveChain(backend, "auto-save")).foreverM
+
+            // Expose real backend to routes, restore chain, then run forever
+            backendRef.set(backend)                                                    *>
+            loadChain                                                                  *>
+            IO.println("=" * 60)                                                       *>
+            IO.println("  SummitCoin Node  |  SMT Blockchain")                         *>
+            IO.println("=" * 60)                                                       *>
+            IO.println(s"  PORT env       = ${sys.env.getOrElse("PORT", "(not set)")}") *>
+            IO.println(s"  Binding to     0.0.0.0:$serverPort")                       *>
+            IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                *>
+            IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
+            IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")         *>
+            IO.println(s"  Auto-save      every 30 seconds")                          *>
+            IO.println("=" * 60)                                                       *>
+            periodicSave.background.surround(IO.never.onCancel(shutdown))
+          }
         }
     }
   }
