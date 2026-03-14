@@ -43,7 +43,7 @@ class DbBackend(xa: Transactor[IO]) extends PersistenceBackend {
         chain_data TEXT    NOT NULL,
         saved_at   TIMESTAMP DEFAULT NOW()
       )
-    """.update.run.void
+    """.update.run.map(_ => ())
 
   def initSchema(): IO[Unit] = createTable.transact(xa)
 
@@ -54,7 +54,7 @@ class DbBackend(xa: Transactor[IO]) extends PersistenceBackend {
       ON CONFLICT (id) DO UPDATE SET
         chain_data = EXCLUDED.chain_data,
         saved_at   = EXCLUDED.saved_at
-    """.update.run.void.transact(xa)
+    """.update.run.map(_ => ()).transact(xa)
 
   def load(): IO[Option[List[Block]]] =
     sql"SELECT chain_data FROM blockchain WHERE id = 1"
