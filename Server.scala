@@ -17,6 +17,7 @@ import org.typelevel.log4cats.LoggerFactory
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import java.nio.file.{Files, Paths, StandardCopyOption}
 import java.time.Instant
+import scala.concurrent.duration.*
 
 // ── Request / Response shapes ─────────────────────────────────────────────────
 
@@ -169,17 +170,18 @@ object SummitCoinNode extends IOApp.Simple {
   }
 
   /** Save chain, log result, swallow errors so routes always succeed. */
-  private def saveChain(backend: PersistenceBackend): IO[Unit] =
+  private def saveChain(backend: PersistenceBackend, context: String = "save"): IO[Unit] =
+    IO.println(s"  [$context] Saving to ${backend.modeName}...") *>
     backend.save(bc.getChain)
       .flatMap { _ =>
         val n = bc.getChain.length
         IO { lastSaveStatus = Right(Instant.now()) } *>
-        IO.println(s"  Blockchain saved via ${backend.modeName} ($n blocks)")
+        IO.println(s"  [$context] Saved successfully ($n blocks)")
       }
       .handleErrorWith { e =>
         val msg = s"${e.getClass.getName}: ${e.getMessage}"
         IO { lastSaveStatus = Left(s"Save failed: $msg") } *>
-        IO.println(s"  ERROR: Blockchain save failed (${backend.modeName}): $msg")
+        IO.println(s"  [$context] Save FAILED: $msg")
       }
 
   // ── Routes ───────────────────────────────────────────────────────────────────
@@ -274,7 +276,8 @@ object SummitCoinNode extends IOApp.Simple {
 
     case GET -> Root / "mine" =>
       IO.blocking(bc.mineBlock()).flatMap { block =>
-        saveChain(backend) *>
+        IO.println(s"  Block #${block.index} mined, saving to ${backend.modeName}...") *>
+        saveChain(backend, s"Block #${block.index}") *>
         Ok(Json.obj(
           "success" -> true.asJson,
           "message" -> s"Block #${block.index} mined — fresh tracks on the chain!".asJson,
@@ -293,7 +296,8 @@ object SummitCoinNode extends IOApp.Simple {
               case Left(err) => BadRequest(Json.obj("error" -> err.asJson))
               case Right(_)  =>
                 IO.blocking(bc.mineBlock()).flatMap { block =>
-                  saveChain(backend) *>
+                  IO.println(s"  Block #${block.index} mined (faucet), saving to ${backend.modeName}...") *>
+                  saveChain(backend, s"Block #${block.index} faucet") *>
                   Ok(Json.obj(
                     "success" -> true.asJson,
                     "message" -> s"25 SMT dropped to ${body.address} — first tracks are yours!".asJson,
@@ -366,6 +370,10 @@ object SummitCoinNode extends IOApp.Simple {
         .withHttpApp(corsApp)
         .build
         .use { _ =>
+          // Periodic auto-save every 30 s — safety net in case a post-mine save fails
+          val periodicSave: IO[Nothing] =
+            (IO.sleep(30.seconds) *> saveChain(backend, "auto-save")).foreverM
+
           IO.println("=" * 60)                                                       *>
           IO.println("  SummitCoin Node  |  SMT Blockchain")                         *>
           IO.println("=" * 60)                                                       *>
@@ -375,8 +383,9 @@ object SummitCoinNode extends IOApp.Simple {
           IO.println(s"  Listening on   http://0.0.0.0:$serverPort")                *>
           IO.println(s"  Mining reward  ${SummitCoin.MINING_REWARD} SMT per block") *>
           IO.println(s"  PoW difficulty ${Miner.difficulty} leading zeros")         *>
+          IO.println(s"  Auto-save      every 30 seconds")                          *>
           IO.println("=" * 60)                                                       *>
-          IO.never.onCancel(shutdown)
+          periodicSave.background.surround(IO.never.onCancel(shutdown))
         }
     }
   }
